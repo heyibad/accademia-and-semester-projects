@@ -1,11 +1,23 @@
-from typing import Optional
+from typing import Optional, cast
 import chainlit as cl
-import main
-from db import get_or_create_user, get_create_chat, create_message, get_messages_by_chat_id, engine 
+import json
 from uuid import UUID
 from sqlmodel import Session
-import json
+from db import get_or_create_user, get_create_chat, create_message, get_messages_by_chat_id, engine
+from agents import Agent, Runner, AsyncOpenAI, OpenAIChatCompletionsModel, RunConfig
+import os
+from dotenv import load_dotenv, find_dotenv
 
+# Load environment variables (only once)
+load_dotenv(find_dotenv())
+
+# Retrieve necessary environment variables
+gemini_api_key = os.getenv("GEMINI_API_KEY")
+model_name = os.getenv("MODEL_NAME", "gemini-2.0-flash")  # Use a default if not specified
+base_url = os.getenv("LLM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/")
+
+if not gemini_api_key:
+    raise ValueError("GEMINI_API_KEY is not set. Please ensure it is defined in your .env file.")
 
 @cl.password_auth_callback
 async def auth_callback(email: str, password: str):
@@ -46,16 +58,46 @@ async def start_chat():
     )
     print(f"Chat {chat.id} created successfully")
     
-    # Now set the session variables
+    # Set up the LLM client and config
+    external_client = AsyncOpenAI(
+        api_key=gemini_api_key,
+        base_url=base_url,
+    )
+    
+    model = OpenAIChatCompletionsModel(
+        model=model_name,
+        openai_client=external_client
+    )
+    
+    config = RunConfig(
+        model=model,
+        model_provider=external_client,
+        tracing_disabled=True
+    )
+    
+    # Create the agent
+    agent = Agent(
+        name="Study Assistant",
+        instructions="""
+        You are a helpful study assistant that helps users with their academic questions.
+        Focus only on educational and study-related topics. Be informative, accurate, and supportive.
+        Provide detailed explanations that help the user understand complex topics.
+        Avoid giving assistance on non-academic subjects.
+        Use examples and analogies to make concepts clearer.
+        """,
+        model=model
+    )
+    
+    # Now set all session variables
     cl.user_session.set("chat_id", chat.id)
     cl.user_session.set("email", email)
+    cl.user_session.set("agent", agent)
+    cl.user_session.set("config", config)
     
     # Get messages history and convert to expected format
     db_messages = await get_messages_by_chat_id(chat_id=chat.id)
     print(f"Retrieved {len(db_messages)} messages from the database.")
     
-    print(f"Messages in the database: {db_messages}")
-   
     history = []
     
     if db_messages:
@@ -78,25 +120,28 @@ async def start_chat():
         for msg in history:
             if msg["role"] == "user":
                 await cl.Message(
-                    content=f"User: {msg['content']}"
+                    content=msg['content']
                 ).send()
             else:
                 await cl.Message(
-                    content=f"Assistant: {msg['content']}"
+                    content=msg['content'],
+                    author="Assistant"
                 ).send()
     else:
-     await cl.Message(
-        content="Welcome to the Study Chatbot! How can I Guide you?").send()
-    
+        await cl.Message(content="Welcome to the Study Chatbot! How can I Guide you?").send()
+
 @cl.on_message
 async def handle_message(message: cl.Message):
+    """Process incoming messages and generate responses."""
     # Get session data
     history = cl.user_session.get("history") or []
     chat_id = cl.user_session.get("chat_id")
     email = cl.user_session.get("email")
+    agent = cast(Agent, cl.user_session.get("agent"))
+    config = cast(RunConfig, cl.user_session.get("config"))
     
-    if not chat_id or not email:
-        print("Error: Missing chat_id or email in session")
+    if not chat_id or not email or not agent or not config:
+        print("Error: Missing session data")
         await cl.Message(content="Session error. Please refresh and try again.").send()
         return
     
@@ -112,33 +157,45 @@ async def handle_message(message: cl.Message):
     create_message(
         chat_id=chat_id,
         sender=email,
-        content=user_message
+        content=json.dumps(user_message)  # Ensure we're saving JSON string
     )
     
-    # Process the message with the LLM
+    # Create a message for streaming responses
+    msg = cl.Message(content="", author="Assistant")
+    await msg.send()
+    
     try:
-        print("----------=---------------")
-        print(f"Processing message with history: {history}")
-        print("----------=---------------")
-        result = await main.main(query=history)
+        print("\n[CALLING_AGENT_WITH_CONTEXT]\n", history, "\n")
+        
+        # Run the agent with streaming enabled
+        result = Runner.run_streamed(agent, history, run_config=config)
+        
+        full_response = ""
+        # Stream the response token by token
+        async for event in result.stream_events():
+            if event.type == "raw_response_event" and hasattr(event.data, 'delta'):
+                token = event.data.delta
+                full_response += token
+                await msg.stream_token(token)
         
         # Add assistant response to history
-        assistant_message = {"role": "assistant", "content": result}
+        assistant_message = {"role": "assistant", "content": full_response}
         history.append(assistant_message)
         
         # Save assistant message to database
         create_message(
             chat_id=chat_id,
             sender="assistant",
-            content=assistant_message
+            content=json.dumps(assistant_message)  # Ensure we're saving JSON string
         )
         
         # Update session history
         cl.user_session.set("history", history)
         
-        # Send response to the user
-        await cl.Message(content=str(result)).send()
+        # Log the interaction
+        print(f"User: {message.content}")
+        print(f"Assistant: {msg.content}")
         
     except Exception as e:
         print(f"Error processing message: {str(e)}")
-        await cl.Message(content="Sorry, I encountered an error processing your request.").send()
+        await msg.update(content=f"Sorry, I encountered an error: {str(e)}")
