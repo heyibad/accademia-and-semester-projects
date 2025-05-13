@@ -82,6 +82,7 @@ def create_message(chat_id: UUID, sender: str, content: Union[str, Dict[str, Any
         chat = session.exec(statement).first()
         if chat:
             chat.last_msg_at = datetime.utcnow()
+            session.add(chat)
             
         # Create the new message
         new_message = Message(
