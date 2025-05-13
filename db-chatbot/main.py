@@ -41,8 +41,28 @@ set_tracing_disabled(disabled=True)
 # Define an async helper to run the agent with conversation history
 async def agent_run(agent: Agent, history: List[Dict[str, str]]):
     try:
-        res = await Runner.run(agent, input=history)
-        return res
+        # Get the current message from chainlit context for streaming
+        msg = cl.Message.get_current()
+        
+        # Run the agent with streaming
+        res = await Runner.run_streamed(agent, input=history)
+        
+        # Track full response
+        full_response = ""
+        
+        # Stream the response token by token
+        async for event in res.stream_events():
+            if event.type == "raw_response_event" and hasattr(event.data, 'delta'):
+                token = event.data.delta
+                full_response += token
+                
+                # Stream token to UI
+                if msg:
+                    await msg.stream_token(token)
+                    
+        # Return the complete response
+        return full_response
+                
     except Exception as e:
         print(f"Error running agent: {str(e)}")
         traceback.print_exc()
@@ -83,11 +103,10 @@ async def main(query: Union[str, List[Dict[str, str]]]) -> str:
             formatted_query = query
         
         # Run the agent
-        res = await agent_run(talking_agent, formatted_query)
+        response = await agent_run(talking_agent, formatted_query)
         
-        if res:
-            print(f"Response: {res.final_output}")
-            return res.final_output
+        if response:
+            return response
         else:
             return "I'm sorry, I encountered an error processing your request."
             
