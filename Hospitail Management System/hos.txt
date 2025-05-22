@@ -1,0 +1,11 @@
+
+The Hospital Management System
+The Project has been created by Group #2
+For OOP - BSDS
+
+Members:
+BDA-24F-024
+BDA-24F-021
+BDA-24F-017
+BDA-24F-019
+BDA-24F-043
